@@ -94,19 +94,29 @@ class Database:
                 "name": "良笑GoodSmile",
                 "aliases": ["GSC", "良笑", "GoodSmile", "良笑旗舰店"],
                 "weibo_uid": "2638252657",
+                "wechat_account": "",
                 "notes": "良笑GoodSmile官方旗舰店（官方微博UID: 2638252657）"
             },
             {
                 "name": "GoodSmile良笑社",
                 "aliases": ["良笑社", "GSC官博"],
                 "weibo_uid": "1798143541",
+                "wechat_account": "",
                 "notes": "GoodSmile良笑社官方微博（官方微博UID: 1798143541）"
             },
             {
                 "name": "猫受屋",
                 "aliases": ["猫屋"],
                 "weibo_uid": "1874987014",
+                "wechat_account": "",
                 "notes": "猫受屋手办模型官方微博（官方微博UID: 1874987014）"
+            },
+            {
+                "name": "淘模玩",
+                "aliases": ["TaoMorrow", "淘模", "淘模玩TaoMorrow"],
+                "weibo_uid": "",
+                "wechat_account": "TaoMorrow",
+                "notes": "淘模玩官方微信公众号（微信: TaoMorrow）"
             }
         ]
 
@@ -114,25 +124,27 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             for s in preset_shops:
-                # 检查是否已存在同名或同UID店铺
+                wb_uid = s.get("weibo_uid", "")
+                wx_acc = s.get("wechat_account", "")
                 cursor.execute(
-                    "SELECT id, name, aliases FROM shops WHERE name = ? OR weibo_uid = ?",
-                    (s["name"], s["weibo_uid"])
+                    "SELECT id, name, aliases, wechat_account FROM shops WHERE name = ? OR (weibo_uid != '' AND weibo_uid = ?) OR (wechat_account != '' AND wechat_account = ?)",
+                    (s["name"], wb_uid, wx_acc)
                 )
                 row = cursor.fetchone()
                 aliases_json = json.dumps(s["aliases"], ensure_ascii=False)
                 if not row:
                     cursor.execute("""
                     INSERT INTO shops (name, aliases, weibo_uid, wechat_account, qq_groups, admin_qq_ids, notes, created_at, updated_at)
-                    VALUES (?, ?, ?, '', '[]', '[]', ?, ?, ?)
-                    """, (s["name"], aliases_json, s["weibo_uid"], s["notes"], now, now))
+                    VALUES (?, ?, ?, ?, '[]', '[]', ?, ?, ?)
+                    """, (s["name"], aliases_json, wb_uid, wx_acc, s["notes"], now, now))
                 else:
-                    # 如果已存在（如用户录入了 GSC），确保别名库健全
-                    existing_aliases = json.loads(row["aliases"] or "[]")
+                    # 如果已存在，更新别名与公众号配置
+                    existing_aliases = json.loads(row[2] or "[]")
                     merged_aliases = list(dict.fromkeys(existing_aliases + s["aliases"]))
+                    new_wx = row[3] or wx_acc
                     cursor.execute(
-                        "UPDATE shops SET aliases = ?, updated_at = ? WHERE id = ?",
-                        (json.dumps(merged_aliases, ensure_ascii=False), now, row["id"])
+                        "UPDATE shops SET aliases = ?, wechat_account = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(merged_aliases, ensure_ascii=False), new_wx, now, row[0])
                     )
             conn.commit()
 
@@ -362,9 +374,10 @@ class Database:
         content: str,
         source_id: str,
         source_url: str = "",
-        matched_items: Optional[List[str]] = None
+        matched_items: Optional[List[str]] = None,
+        created_at: Optional[str] = None
     ) -> int:
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = created_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         matched_json = json.dumps(matched_items or [], ensure_ascii=False)
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -409,7 +422,7 @@ class Database:
         query = f"""
         SELECT * FROM notices 
         WHERE {' AND '.join(conditions)}
-        ORDER BY id DESC
+        ORDER BY created_at DESC, id DESC
         """
 
         with self._get_connection() as conn:
@@ -459,13 +472,13 @@ class Database:
                 cursor.execute("""
                 SELECT * FROM notices 
                 WHERE shop_id = ? OR shop_name = ? OR shop_name LIKE ?
-                ORDER BY id DESC LIMIT 1
+                ORDER BY created_at DESC, id DESC LIMIT 1
                 """, (target_shop["id"], target_shop["name"], f"%{shop_name.strip()}%"))
             else:
                 cursor.execute("""
                 SELECT * FROM notices 
                 WHERE shop_name = ? OR shop_name LIKE ?
-                ORDER BY id DESC LIMIT 1
+                ORDER BY created_at DESC, id DESC LIMIT 1
                 """, (shop_name.strip(), f"%{shop_name.strip()}%"))
             row = cursor.fetchone()
             if row:

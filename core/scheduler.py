@@ -207,7 +207,8 @@ class Scheduler:
             content=content,
             source_id=source_id,
             source_url=source_url,
-            matched_items=matched_items
+            matched_items=matched_items,
+            created_at=notice.get("created_at")
         )
         return True
 

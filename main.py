@@ -480,7 +480,9 @@ class PreorderReminderPlugin(Star):
         if shop_name:
             target_shop = self.db.get_shop_by_name(shop_name)
             if not target_shop:
-                return f"系统监控库中未找到名为【{shop_name}】的店铺档案。您可以先使用指令 `/添加店铺 {shop_name}` 将其加入监控。"
+                logger.info(f"[PreorderReminder] 用户查询未建档店铺【{shop_name}】，自动建档并尝试即时拉取...")
+                self.db.add_shop(name=shop_name, wechat_account=shop_name)
+                target_shop = self.db.get_shop_by_name(shop_name)
 
         filter_shop_name = target_shop["name"] if target_shop else ""
         notices = self.db.get_recent_notices(days=d, notice_type=notice_type, shop_name=filter_shop_name)
@@ -526,9 +528,15 @@ class PreorderReminderPlugin(Star):
         """
         target_shop = self.db.get_shop_by_name(shop_name)
         if not target_shop:
-            return f"未找到名为【{shop_name}】的店铺档案。"
+            logger.info(f"[PreorderReminder] 用户查询未建档店铺【{shop_name}】最新文章，自动建档...")
+            self.db.add_shop(name=shop_name, wechat_account=shop_name)
+            target_shop = self.db.get_shop_by_name(shop_name)
 
-        notice = self.db.get_latest_notice_for_shop(target_shop["name"])
+        notice = self.db.get_latest_notice_for_shop(target_shop["name"]) if target_shop else None
+        if not notice and target_shop:
+            await self.scheduler.refresh_shop(target_shop["name"])
+            notice = self.db.get_latest_notice_for_shop(target_shop["name"])
+
         if notice:
             dt = notice.get("created_at") or "未知时间"
             title = notice.get("title") or "无标题"
