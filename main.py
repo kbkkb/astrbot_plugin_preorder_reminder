@@ -42,7 +42,9 @@ class PreorderReminderPlugin(Star):
             rss_base_url=self.config.get("weibo_rss_base_url", "")
         )
         self.wechat_channel = WeChatChannel(
-            rss_base_url=self.config.get("wechat_rss_base_url", "")
+            rss_base_url=self.config.get("wechat_rss_base_url", ""),
+            enable_ocr=bool(self.config.get("enable_ocr", True)),
+            max_ocr_images=int(self.config.get("max_ocr_images", 6))
         )
         self.qq_group_channel = QQGroupChannel(self.matcher)
 
@@ -624,6 +626,125 @@ class PreorderReminderPlugin(Star):
             yield event.plain_result("🔍 检测到微信文章链接，正在抓取解析补款情报...")
             res = await self.tool_parse_wechat_article(event, url=url)
             yield event.plain_result(res)
+
+    @filter.llm_tool(name="ocr_notice_image")
+    async def tool_ocr_notice_image(
+        self,
+        event: AstrMessageEvent,
+        image_url: str,
+        shop_name: str = ""
+    ) -> str:
+        """从手办模玩补款海报、排期长图或截图中通过本地轻量OCR提取商品信息与补款截止时间并自动比对提醒。
+
+        Args:
+            image_url(string): 图片的网络URL或本地路径
+            shop_name(string): 可选，图片所属店铺名称（如 '淘模玩'、'猫受屋'），留空则自动识别
+        """
+        try:
+            from .core.ocr_helper import OCRHelper
+        except (ImportError, ValueError):
+            from core.ocr_helper import OCRHelper
+        if not OCRHelper.is_available():
+            return "本地 OCR 引擎未就绪或未安装 rapidocr_onnxruntime。"
+
+        ocr_text = await OCRHelper.extract_text_from_url(image_url)
+        if not ocr_text:
+            return "未能从图片中提取到清晰的文字信息，可能图片过小或画质模糊。"
+
+        target_shop = None
+        if shop_name:
+            target_shop = self.db.get_shop_by_name(shop_name)
+        if not target_shop:
+            for s in self.db.get_all_shops():
+                if s["name"] in ocr_text:
+                    target_shop = s
+                    break
+
+        final_shop_name = target_shop["name"] if target_shop else (shop_name.strip() or "截图店铺")
+        notice_type = self.matcher.classify_notice(ocr_text[:50], ocr_text)
+        deadline = self.matcher.extract_deadline(ocr_text)
+
+        notice_data = {
+            "shop_id": target_shop["id"] if target_shop else None,
+            "shop_name": final_shop_name,
+            "channel": "ocr_image",
+            "source_id": f"image_{abs(hash(image_url))}",
+            "title": f"【图文识别】{ocr_text.splitlines()[0] if ocr_text.splitlines() else '补款海报'}",
+            "content": ocr_text,
+            "source_url": image_url
+        }
+        await self.scheduler.process_single_notice(notice_data)
+
+        type_desc = "补款通知" if notice_type == "replenish" else "新开预订"
+        return (
+            f"📷 本地 OCR 图片识别完成！\n"
+            f"• 识别所属：{final_shop_name}\n"
+            f"• 情报类型：{type_desc}\n"
+            f"• 截止时间：{deadline or '图中未明确'}\n"
+            f"• 识别内容摘要：\n{ocr_text[:300]}...\n\n"
+            f"已自动入库并比对触发在监用户的补款提醒！"
+        )
+
+    @filter.command("识别补款图片")
+    async def cmd_ocr_image(self, event: AstrMessageEvent, shop_name: str = ""):
+        """从发送的图片或回复的图片中提取补款信息。用法：/识别补款图片 [店铺名]（需附带或回复图片）"""
+        from astrbot.api.message_components import Image
+        try:
+            from .core.ocr_helper import OCRHelper
+        except (ImportError, ValueError):
+            from core.ocr_helper import OCRHelper
+
+        images = []
+        if hasattr(event, "message_obj") and event.message_obj and hasattr(event.message_obj, "message"):
+            for comp in event.message_obj.message:
+                if isinstance(comp, Image):
+                    images.append(comp)
+
+        if not images:
+            yield event.plain_result("请在发送指令时同时附带补款海报/长图，或回复某张图片发送指令。")
+            return
+
+        yield event.plain_result(f"🔍 正在通过本地轻量 OCR 分析 {len(images)} 张图片，请稍候...")
+
+        import base64
+        all_texts = []
+        for idx, img in enumerate(images):
+            try:
+                b64 = await img.convert_to_base64()
+                if b64:
+                    raw_bytes = base64.b64decode(b64)
+                    txt = await OCRHelper.extract_text_from_bytes(raw_bytes)
+                    if txt:
+                        all_texts.append(f"--- 图{idx + 1} ---\n{txt}")
+            except Exception as e:
+                logger.debug(f"[OCR] 识别单张组件图片异常: {e}")
+
+        if not all_texts:
+            yield event.plain_result("未能识别出图片中的有效文字，可能图片过小或内容模糊。")
+            return
+
+        full_content = "\n\n".join(all_texts)
+        target_shop = self.db.get_shop_by_name(shop_name) if shop_name else None
+        final_shop = target_shop["name"] if target_shop else (shop_name.strip() or "图片识别店铺")
+
+        notice_data = {
+            "shop_id": target_shop["id"] if target_shop else None,
+            "shop_name": final_shop,
+            "channel": "ocr_image",
+            "source_id": f"image_{abs(hash(full_content[:100]))}",
+            "title": f"【图文识别】{full_content.splitlines()[0] if full_content.splitlines() else '补款海报'}",
+            "content": full_content,
+            "source_url": ""
+        }
+        await self.scheduler.process_single_notice(notice_data)
+
+        yield event.plain_result(
+            f"✅ 本地 OCR 图片识别完成并已入库！\n"
+            f"• 店铺：{final_shop}\n"
+            f"• 识别文字量：{len(full_content)} 字\n"
+            f"• 识别摘要：\n{full_content[:260]}...\n\n"
+            f"已自动完成对群友订阅手办的匹配与推送！"
+        )
 
     @filter.llm_tool(name="query_today_notices")
     async def tool_query_today_notices(

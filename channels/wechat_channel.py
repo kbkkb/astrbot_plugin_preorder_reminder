@@ -10,8 +10,10 @@ from .base_channel import BaseChannel
 logger = logging.getLogger("astrbot_plugin_preorder_reminder")
 
 class WeChatChannel(BaseChannel):
-    def __init__(self, rss_base_url: str = ""):
+    def __init__(self, rss_base_url: str = "", enable_ocr: bool = True, max_ocr_images: int = 6):
         self.rss_base_url = rss_base_url.rstrip("/")
+        self.enable_ocr = enable_ocr
+        self.max_ocr_images = max_ocr_images
         self.last_status: Dict[str, Dict[str, Any]] = {}
 
     def get_shop_status(self, shop: Dict[str, Any]) -> Dict[str, Any]:
@@ -25,7 +27,6 @@ class WeChatChannel(BaseChannel):
                 "msg": f"已绑定公众号【{account}】，但未配置抓取服务地址(wechat_rss_base_url)。微信官方禁止外部免登录爬虫，需配置自建 WeWe-RSS 服务，或直接将文章链接发给 Bot 解析。"
             }
         return self.last_status.get(account, {"status": "ok", "msg": "已连接 WeWe-RSS 服务"})
-
 
     def _clean_article_html(self, raw_html: str) -> str:
         """清洗公众号文章 HTML"""
@@ -41,6 +42,47 @@ class WeChatChannel(BaseChannel):
         clean = re.sub(r"[ \t]+", " ", clean)
         clean = re.sub(r"\n{3,}", "\n\n", clean)
         return clean
+
+    async def extract_article_body_and_ocr(
+        self,
+        html_content: str,
+        session: aiohttp.ClientSession
+    ) -> str:
+        """从微信文章 HTML 中提取文字，并在需要时通过本地轻量 OCR 识别排期长图与海报文字"""
+        if not html_content:
+            return ""
+
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # 1. 提取基础文本
+        clean_text = self._clean_article_html(html_content)
+
+        # 2. 如果启用了 OCR，提取图片并进行本地识别
+        if self.enable_ocr:
+            img_urls = []
+            for img in soup.find_all("img"):
+                src = img.get("data-src") or img.get("src") or ""
+                if src and src.startswith("http"):
+                    img_urls.append(src)
+
+            if img_urls:
+                try:
+                    try:
+                        from ..core.ocr_helper import OCRHelper
+                    except (ImportError, ValueError):
+                        from core.ocr_helper import OCRHelper
+                    if OCRHelper.is_available():
+                        ocr_text = await OCRHelper.batch_extract_text_from_urls(
+                            img_urls,
+                            max_images=self.max_ocr_images,
+                            session=session
+                        )
+                        if ocr_text:
+                            clean_text = f"{clean_text}\n\n【📷 本地OCR识别海报/排期图内容】\n{ocr_text}"
+                except Exception as e:
+                    logger.debug(f"[WeChatChannel] 本地 OCR 识别异常: {e}")
+
+        return clean_text
 
     async def fetch_latest_notices(self, shop: Dict[str, Any]) -> List[Dict[str, Any]]:
         wechat_account = str(shop.get("wechat_account") or "").strip()
@@ -67,7 +109,7 @@ class WeChatChannel(BaseChannel):
                                     items = soup.find_all("item")
                                     for item in items[:8]:
                                         title = item.title.text if item.title else ""
-                                        desc = self._clean_article_html(item.description.text if item.description else "")
+                                        desc = await self.extract_article_body_and_ocr(item.description.text, session) if item.description else ""
                                         link = item.link.text if item.link else ""
                                         guid = item.guid.text if item.guid else link or title
                                         results.append({
@@ -76,7 +118,7 @@ class WeChatChannel(BaseChannel):
                                             "channel": "wechat",
                                             "source_id": f"wechat_{guid}",
                                             "title": title,
-                                            "content": f"{title}\n\n{desc[:3000]}",  # 截取前3000字符避免过大
+                                            "content": f"{title}\n\n{desc[:10000]}",
                                             "source_url": link,
                                             "created_at": item.pubDate.text if item.pubDate else ""
                                         })
@@ -173,7 +215,7 @@ class WeChatChannel(BaseChannel):
                                             art_soup = BeautifulSoup(await r3.text(), "html.parser")
                                             content_el = art_soup.find("div", class_="rich_media_content")
                                             if content_el:
-                                                article_content = self._clean_article_html(content_el.decode_contents())
+                                                article_content = await self.extract_article_body_and_ocr(str(content_el), session)
                                 except Exception:
                                     pass
 
@@ -187,7 +229,7 @@ class WeChatChannel(BaseChannel):
                                 "channel": "wechat",
                                 "source_id": f"wechat_{abs(hash(real_url or raw_title))}",
                                 "title": raw_title,
-                                "content": f"{raw_title}\n\n{article_content[:3000]}",
+                                "content": f"{raw_title}\n\n{article_content[:10000]}",
                                 "source_url": real_url or href,
                                 "created_at": created_at
                             })
@@ -220,7 +262,7 @@ class WeChatChannel(BaseChannel):
                         content_el = soup.find("div", class_="rich_media_content")
                         
                         title = title_el.get_text().strip() if title_el else ""
-                        content = self._clean_article_html(content_el.decode_contents()) if content_el else ""
+                        content = await self.extract_article_body_and_ocr(str(content_el), session) if content_el else ""
                         return {
                             "title": title,
                             "content": content,

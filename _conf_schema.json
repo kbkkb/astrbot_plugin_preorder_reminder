@@ -48,5 +48,15 @@
     "type": "bool",
     "description": "是否启用大模型辅助模糊语义匹配（提升缩写、昵称、外号与官方商品名的命中率）",
     "default": true
+  },
+  "enable_ocr": {
+    "type": "bool",
+    "description": "是否启用本地轻量 OCR 自动识别公众号海报长图与排期表文字（纯本地 CPU 推理，0 Token 成本，解耦大模型）",
+    "default": true
+  },
+  "max_ocr_images": {
+    "type": "int",
+    "description": "单篇推文最多进行 OCR 识别的海报图片数量（按内容顺序提取）",
+    "default": 6
   }
 }
