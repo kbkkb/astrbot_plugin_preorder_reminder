@@ -450,3 +450,28 @@ class Database:
             matched_items=[]
         )
 
+    def get_latest_notice_for_shop(self, shop_name: str) -> Optional[Dict[str, Any]]:
+        """获取指定店铺最新的一篇通知/博文/文章（不受时间范围限制）"""
+        target_shop = self.get_shop_by_name(shop_name)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if target_shop:
+                cursor.execute("""
+                SELECT * FROM notices 
+                WHERE shop_id = ? OR shop_name = ? OR shop_name LIKE ?
+                ORDER BY id DESC LIMIT 1
+                """, (target_shop["id"], target_shop["name"], f"%{shop_name.strip()}%"))
+            else:
+                cursor.execute("""
+                SELECT * FROM notices 
+                WHERE shop_name = ? OR shop_name LIKE ?
+                ORDER BY id DESC LIMIT 1
+                """, (shop_name.strip(), f"%{shop_name.strip()}%"))
+            row = cursor.fetchone()
+            if row:
+                d = dict(row)
+                d["matched_items"] = json.loads(d.get("matched_items") or "[]")
+                return d
+            return None
+
+

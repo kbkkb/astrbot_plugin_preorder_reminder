@@ -12,6 +12,20 @@ logger = logging.getLogger("astrbot_plugin_preorder_reminder")
 class WeChatChannel(BaseChannel):
     def __init__(self, rss_base_url: str = ""):
         self.rss_base_url = rss_base_url.rstrip("/")
+        self.last_status: Dict[str, Dict[str, Any]] = {}
+
+    def get_shop_status(self, shop: Dict[str, Any]) -> Dict[str, Any]:
+        """获取店铺微信公众号渠道的最新状态诊断"""
+        account = str(shop.get("wechat_account") or "").strip()
+        if not account:
+            return {"status": "no_account", "msg": "未配置公众号名称/ID"}
+        if not self.rss_base_url:
+            return {
+                "status": "need_service",
+                "msg": f"已绑定公众号【{account}】，但未配置抓取服务地址(wechat_rss_base_url)。微信官方禁止外部免登录爬虫，需配置自建 WeWe-RSS 服务，或直接将文章链接发给 Bot 解析。"
+            }
+        return self.last_status.get(account, {"status": "ok", "msg": "已连接 WeWe-RSS 服务"})
+
 
     def _clean_article_html(self, raw_html: str) -> str:
         """清洗公众号文章 HTML"""

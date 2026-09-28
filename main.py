@@ -487,11 +487,19 @@ class PreorderReminderPlugin(Star):
         if target_shop and not notices:
             # 本地无记录时，尝试即时增量拉取一次
             refresh_res = await self.scheduler.refresh_shop(target_shop["name"])
-            status_info = refresh_res.get("channel_status", {})
-            if status_info.get("status") == "need_cookie":
-                extra_hint = "该店铺微博触发反爬验证(HTTP 432/需登录)，暂无法自动抓取。请联系管理员私聊使用 `/设置微博cookie <cookie>` 配置 Cookie，或发送 `/录入通知` 手动登记。"
-            elif refresh_res.get("new_count", 0) > 0:
+            c_status = refresh_res.get("channel_status", {})
+            wb_s = c_status.get("weibo")
+            wx_s = c_status.get("wechat")
+            hints = []
+            if wb_s and wb_s.get("status") == "need_cookie":
+                hints.append("该店铺微博触发反爬验证(HTTP 432/需登录)，需配置微博Cookie（私聊发送 `/设置微博cookie <cookie>`）")
+            if wx_s and wx_s.get("status") == "need_service":
+                hints.append(f"该店铺绑定了微信公众号【{target_shop.get('wechat_account')}】，但系统未配置公众号抓取服务(wechat_rss_base_url)。微信官方禁止外部免登录爬虫，请配置WeWe-RSS服务，或直接把文章链接发送给Bot解析")
+
+            if refresh_res.get("new_count", 0) > 0:
                 notices = self.db.get_recent_notices(days=d, notice_type=notice_type, shop_name=filter_shop_name)
+            elif hints:
+                extra_hint = "；".join(hints)
             else:
                 extra_hint = "已即时检查网络渠道，但该店铺近几天尚未发布或抓取到相关情报。"
 
@@ -502,6 +510,120 @@ class PreorderReminderPlugin(Star):
             shop_name=target_shop["name"] if target_shop else shop_name,
             extra_hint=extra_hint
         )
+
+    @filter.llm_tool(name="get_latest_shop_notice")
+    async def tool_get_latest_shop_notice(
+        self,
+        event: AstrMessageEvent,
+        shop_name: str
+    ) -> str:
+        """查询指定店铺在系统记录中的最新一篇公告或上一篇文章内容与发布时间（当用户询问“上一篇文章是什么时候”、“上一篇内容有什么”、“最新发布的文章是什么”等时调用）。
+
+        Args:
+            shop_name(string): 店铺名称或别名（如 '淘模玩'、'GSC'、'猫受屋'）
+        """
+        target_shop = self.db.get_shop_by_name(shop_name)
+        if not target_shop:
+            return f"未找到名为【{shop_name}】的店铺档案。"
+
+        notice = self.db.get_latest_notice_for_shop(target_shop["name"])
+        if notice:
+            dt = notice.get("created_at") or "未知时间"
+            title = notice.get("title") or "无标题"
+            content = notice.get("content") or ""
+            channel = notice.get("channel", "未知渠道")
+            ch_desc = "微信公众号" if channel == "wechat" else ("官方微博" if channel == "weibo" else channel)
+            return (
+                f"📰【{target_shop['name']}】的最新记录公告/文章详情：\n"
+                f"• 发布时间：{dt}\n"
+                f"• 来源渠道：{ch_desc}\n"
+                f"• 标题：{title}\n"
+                f"• 正文摘要：\n{content[:600]}\n"
+                f"{'...(正文已截断)' if len(content) > 600 else ''}"
+            )
+        else:
+            wx_account = target_shop.get("wechat_account", "")
+            wb_uid = target_shop.get("weibo_uid", "")
+            hints = []
+            if wx_account and not self.config.get("wechat_rss_base_url"):
+                hints.append(f"该店绑定了公众号【{wx_account}】，但系统未配置公众号抓取服务(wechat_rss_base_url)。微信官方禁止外部免登录爬虫，请配置WeWe-RSS服务，或直接把文章链接发送给Bot进行即时解析")
+            if wb_uid and not self.config.get("weibo_cookie") and not self.weibo_channel.custom_cookie:
+                hints.append(f"该店绑定了微博UID【{wb_uid}】，因微博432风控需配置Cookie（私聊发送 /设置微博cookie）")
+
+            hint_str = "；".join(hints) if hints else "该店铺目前尚未成功拉取到历史博文或文章"
+            return f"数据库中暂无【{target_shop['name']}】的历史文章/公告记录。\n💡 原因诊断：{hint_str}。"
+
+    @filter.llm_tool(name="parse_wechat_article")
+    async def tool_parse_wechat_article(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        shop_name: str = ""
+    ) -> str:
+        """解析单篇微信公众号文章链接（形如 https://mp.weixin.qq.com/s/...），提取补款或新开预订情报并自动推送给在监买家。当用户发送微信文章链接或要求解析微信推文时调用。
+
+        Args:
+            url(string): 微信公众号文章链接（需以 mp.weixin.qq.com 开头）
+            shop_name(string): 可选，文章所属的店铺名称（如 '淘模玩'、'猫受屋'），留空则自动识别
+        """
+        if not ("mp.weixin.qq.com" in url or "weixin.qq.com" in url):
+            return "提供的链接不是有效的微信公众号文章链接（需以 mp.weixin.qq.com 开头）。"
+
+        article = await self.wechat_channel.parse_article_url(url)
+        if not article or not article.get("title"):
+            return "抓取微信文章失败，可能链接已失效或微信临时限制访问。"
+
+        title = article.get("title", "")
+        content = article.get("content", "")
+
+        target_shop = None
+        if shop_name:
+            target_shop = self.db.get_shop_by_name(shop_name)
+        if not target_shop:
+            for s in self.db.get_all_shops():
+                if s["name"] in title or s["name"] in content:
+                    target_shop = s
+                    break
+
+        final_shop_name = target_shop["name"] if target_shop else (shop_name.strip() or "公众号店铺")
+        notice_type = self.matcher.classify_notice(title, content)
+        deadline = self.matcher.extract_deadline(content)
+
+        notice_data = {
+            "shop_id": target_shop["id"] if target_shop else None,
+            "shop_name": final_shop_name,
+            "channel": "wechat",
+            "source_id": f"wechat_manual_{abs(hash(url))}",
+            "title": title,
+            "content": f"{title}\n\n{content}",
+            "source_url": url
+        }
+        await self.scheduler.process_single_notice(notice_data)
+
+        type_desc = "补款通知" if notice_type == "replenish" else "新开预订"
+        return (
+            f"✅ 成功解析微信公众号文章！\n"
+            f"• 标题：{title}\n"
+            f"• 所属店铺：{final_shop_name}\n"
+            f"• 情报类型：{type_desc}\n"
+            f"• 截止时间：{deadline or '文中未明确'}\n"
+            f"已将该文内容入库，并自动完成了对在监商品的比对与推送！"
+        )
+
+    @filter.command("解析文章")
+    async def cmd_parse_article(self, event: AstrMessageEvent, url: str, shop_name: str = ""):
+        """解析单篇微信公众号文章并提取补款情报。用法：/解析文章 https://mp.weixin.qq.com/s/... [淘模玩]"""
+        yield event.plain_result(await self.tool_parse_wechat_article(event, url=url, shop_name=shop_name))
+
+    @filter.regex(r"https?://mp\.weixin\.qq\.com/s/[\w\-]+")
+    async def on_wechat_link_received(self, event: AstrMessageEvent):
+        """自动捕获消息中出现的微信公众号文章链接并解析入库"""
+        match = re.search(r"https?://mp\.weixin\.qq\.com/s/[\w\-]+", event.message_str or "")
+        if match:
+            url = match.group(0)
+            yield event.plain_result("🔍 检测到微信文章链接，正在抓取解析补款情报...")
+            res = await self.tool_parse_wechat_article(event, url=url)
+            yield event.plain_result(res)
 
     @filter.llm_tool(name="query_today_notices")
     async def tool_query_today_notices(
@@ -555,4 +677,5 @@ class PreorderReminderPlugin(Star):
         }))
         desc = "补款公告" if ntype == "replenish" else "新开预订情报"
         return f"已成功为店铺【{shop_name}】登记该条{desc}，并已完成对所有在监用户的补款比对！"
+
 

@@ -126,11 +126,18 @@ class Scheduler:
             }
 
         new_notices = await self.poll_single_shop(shop)
-        status_info = self.weibo_channel.get_shop_status(shop)
+        wb_status = self.weibo_channel.get_shop_status(shop) if shop.get("weibo_uid") else None
+        wx_status = self.wechat_channel.get_shop_status(shop) if shop.get("wechat_account") else None
 
         msg = f"店铺【{shop['name']}】刷新完成，新增 {len(new_notices)} 条情报。"
-        if status_info.get("status") == "need_cookie":
-            msg += f"\n⚠️ 注意：{status_info.get('msg')}。建议私聊发送 `/设置微博cookie <cookie>` 恢复自动抓取。"
+        warnings = []
+        if wb_status and wb_status.get("status") == "need_cookie":
+            warnings.append(f"【微博】{wb_status.get('msg')}。建议私聊发送 `/设置微博cookie <cookie>`。")
+        if wx_status and wx_status.get("status") == "need_service":
+            warnings.append(f"【微信公众号】{wx_status.get('msg')}")
+
+        if warnings:
+            msg += "\n⚠️ 渠道说明：\n" + "\n".join(f"• {w}" for w in warnings)
 
         return {
             "success": True,
@@ -138,7 +145,10 @@ class Scheduler:
             "shop": shop,
             "new_count": len(new_notices),
             "notices": new_notices,
-            "channel_status": status_info
+            "channel_status": {
+                "weibo": wb_status,
+                "wechat": wx_status
+            }
         }
 
     async def process_single_notice(self, notice: Dict[str, Any]) -> bool:
