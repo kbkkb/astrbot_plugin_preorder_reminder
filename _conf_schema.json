@@ -34,6 +34,16 @@
     "description": "可选：WeWe-RSS 或微信文章 RSSHub 基础地址（如 http://127.0.0.1:4000）",
     "default": ""
   },
+  "weibo_cookie": {
+    "type": "string",
+    "description": "可选：微博爬虫 Cookie（包含 SUB 凭据），用于绕过微博反爬风控 432 限制",
+    "default": ""
+  },
+  "weibo_rss_base_url": {
+    "type": "string",
+    "description": "可选：自建 RSSHub 基础地址（如 http://127.0.0.1:1200），通过 RSS 模式拉取微博",
+    "default": ""
+  },
   "enable_llm_fuzzy_match": {
     "type": "bool",
     "description": "是否启用大模型辅助模糊语义匹配（提升缩写、昵称、外号与官方商品名的命中率）",

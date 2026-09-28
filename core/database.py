@@ -84,6 +84,58 @@ class Database:
 
             conn.commit()
 
+        # 初始化预设知名模玩店铺
+        self._seed_preset_shops()
+
+    def _seed_preset_shops(self):
+        """预置常用知名模玩店铺档案（如良笑GSC、猫受屋等）"""
+        preset_shops = [
+            {
+                "name": "良笑GoodSmile",
+                "aliases": ["GSC", "良笑", "GoodSmile", "良笑旗舰店"],
+                "weibo_uid": "2638252657",
+                "notes": "良笑GoodSmile官方旗舰店（官方微博UID: 2638252657）"
+            },
+            {
+                "name": "GoodSmile良笑社",
+                "aliases": ["良笑社", "GSC官博"],
+                "weibo_uid": "1798143541",
+                "notes": "GoodSmile良笑社官方微博（官方微博UID: 1798143541）"
+            },
+            {
+                "name": "猫受屋",
+                "aliases": ["猫屋"],
+                "weibo_uid": "1874987014",
+                "notes": "猫受屋手办模型官方微博（官方微博UID: 1874987014）"
+            }
+        ]
+
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for s in preset_shops:
+                # 检查是否已存在同名或同UID店铺
+                cursor.execute(
+                    "SELECT id, name, aliases FROM shops WHERE name = ? OR weibo_uid = ?",
+                    (s["name"], s["weibo_uid"])
+                )
+                row = cursor.fetchone()
+                aliases_json = json.dumps(s["aliases"], ensure_ascii=False)
+                if not row:
+                    cursor.execute("""
+                    INSERT INTO shops (name, aliases, weibo_uid, wechat_account, qq_groups, admin_qq_ids, notes, created_at, updated_at)
+                    VALUES (?, ?, ?, '', '[]', '[]', ?, ?, ?)
+                    """, (s["name"], aliases_json, s["weibo_uid"], s["notes"], now, now))
+                else:
+                    # 如果已存在（如用户录入了 GSC），确保别名库健全
+                    existing_aliases = json.loads(row["aliases"] or "[]")
+                    merged_aliases = list(dict.fromkeys(existing_aliases + s["aliases"]))
+                    cursor.execute(
+                        "UPDATE shops SET aliases = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(merged_aliases, ensure_ascii=False), now, row["id"])
+                    )
+            conn.commit()
+
     # ==================== 店铺管理 (Shop) ====================
 
     def add_shop(
@@ -330,22 +382,39 @@ class Database:
             cursor.execute("SELECT id FROM notices WHERE source_id = ?", (str(source_id).strip(),))
             return cursor.fetchone() is not None
 
-    def get_recent_notices(self, days: int = 1, notice_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_recent_notices(
+        self,
+        days: int = 1,
+        notice_type: Optional[str] = None,
+        shop_name: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         since = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        target_shop = self.get_shop_by_name(shop_name) if shop_name else None
+        
+        conditions = ["created_at >= ?"]
+        params: List[Any] = [since]
+
+        if notice_type:
+            conditions.append("notice_type = ?")
+            params.append(notice_type)
+
+        if shop_name:
+            if target_shop:
+                conditions.append("(shop_id = ? OR shop_name = ? OR shop_name LIKE ?)")
+                params.extend([target_shop["id"], target_shop["name"], f"%{shop_name.strip()}%"])
+            else:
+                conditions.append("(shop_name = ? OR shop_name LIKE ?)")
+                params.extend([shop_name.strip(), f"%{shop_name.strip()}%"])
+
+        query = f"""
+        SELECT * FROM notices 
+        WHERE {' AND '.join(conditions)}
+        ORDER BY id DESC
+        """
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            if notice_type:
-                cursor.execute("""
-                SELECT * FROM notices 
-                WHERE created_at >= ? AND notice_type = ?
-                ORDER BY id DESC
-                """, (since, notice_type))
-            else:
-                cursor.execute("""
-                SELECT * FROM notices 
-                WHERE created_at >= ?
-                ORDER BY id DESC
-                """, (since,))
+            cursor.execute(query, params)
             rows = cursor.fetchall()
             res = []
             for r in rows:
@@ -353,3 +422,31 @@ class Database:
                 d["matched_items"] = json.loads(d.get("matched_items") or "[]")
                 res.append(d)
             return res
+
+    def record_manual_notice(
+        self,
+        shop_name: str,
+        notice_type: str,
+        content: str,
+        title: str = "",
+        source_url: str = ""
+    ) -> int:
+        """手动记录/补录一条店铺情报"""
+        shop = self.get_shop_by_name(shop_name)
+        shop_id = shop["id"] if shop else None
+        final_shop_name = shop["name"] if shop else shop_name.strip()
+        now_ts = int(datetime.datetime.now().timestamp())
+        source_id = f"manual_{now_ts}_{final_shop_name}"
+
+        return self.add_notice(
+            shop_id=shop_id,
+            shop_name=final_shop_name,
+            channel="manual",
+            notice_type=notice_type,
+            title=title or (content[:30] + "..."),
+            content=content,
+            source_id=source_id,
+            source_url=source_url,
+            matched_items=[]
+        )
+

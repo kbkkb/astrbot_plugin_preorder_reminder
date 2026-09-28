@@ -75,33 +75,77 @@ class Scheduler:
         logger.debug(f"[Scheduler] 开始轮询 {len(shops)} 家店铺的最新情报...")
         for shop in shops:
             try:
-                notices = []
-                # 1. 微博
-                if shop.get("weibo_uid"):
-                    wb_notices = await self.weibo_channel.fetch_latest_notices(shop)
-                    if wb_notices:
-                        notices.extend(wb_notices)
-
-                # 2. 微信公众号
-                if shop.get("wechat_account"):
-                    wx_notices = await self.wechat_channel.fetch_latest_notices(shop)
-                    if wx_notices:
-                        notices.extend(wx_notices)
-
-                for n in notices:
-                    await self.process_single_notice(n)
-
+                await self.poll_single_shop(shop)
             except Exception as e:
                 logger.warning(f"[Scheduler] 检查店铺【{shop.get('name')}】失败: {e}")
 
             # 错峰请求，防止连续请求打死目标接口
             await asyncio.sleep(2)
 
-    async def process_single_notice(self, notice: Dict[str, Any]):
-        """处理单条新通知，检查并推送命中订阅"""
+    async def poll_single_shop(self, shop: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """即时拉取单个店铺的最新情报并入库，返回新发现的通知列表"""
+        notices = []
+        shop_name = shop.get("name", "店铺")
+        try:
+            # 1. 微博
+            if shop.get("weibo_uid"):
+                wb_notices = await self.weibo_channel.fetch_latest_notices(shop)
+                if wb_notices:
+                    notices.extend(wb_notices)
+
+            # 2. 微信公众号
+            if shop.get("wechat_account"):
+                wx_notices = await self.wechat_channel.fetch_latest_notices(shop)
+                if wx_notices:
+                    notices.extend(wx_notices)
+
+            new_notices = []
+            for n in notices:
+                saved = await self.process_single_notice(n)
+                if saved:
+                    new_notices.append(n)
+            return new_notices
+        except Exception as e:
+            logger.warning(f"[Scheduler] 即时检查店铺【{shop_name}】失败: {e}")
+            return []
+
+    async def refresh_shop(self, shop_name_or_id: str) -> Dict[str, Any]:
+        """手动或按需刷新店铺并返回诊断结果"""
+        shop = None
+        if str(shop_name_or_id).isdigit():
+            shop = self.db.get_shop_by_id(int(shop_name_or_id))
+        if not shop:
+            shop = self.db.get_shop_by_name(str(shop_name_or_id))
+
+        if not shop:
+            return {
+                "success": False,
+                "msg": f"未找到名为【{shop_name_or_id}】的店铺档案。",
+                "new_count": 0,
+                "notices": []
+            }
+
+        new_notices = await self.poll_single_shop(shop)
+        status_info = self.weibo_channel.get_shop_status(shop)
+
+        msg = f"店铺【{shop['name']}】刷新完成，新增 {len(new_notices)} 条情报。"
+        if status_info.get("status") == "need_cookie":
+            msg += f"\n⚠️ 注意：{status_info.get('msg')}。建议私聊发送 `/设置微博cookie <cookie>` 恢复自动抓取。"
+
+        return {
+            "success": True,
+            "msg": msg,
+            "shop": shop,
+            "new_count": len(new_notices),
+            "notices": new_notices,
+            "channel_status": status_info
+        }
+
+    async def process_single_notice(self, notice: Dict[str, Any]) -> bool:
+        """处理单条新通知，检查并推送命中订阅。返回是否为新入库通知"""
         source_id = notice.get("source_id")
         if not source_id or self.db.is_notice_processed(source_id):
-            return
+            return False
 
         title = notice.get("title", "")
         content = notice.get("content", "")
@@ -155,6 +199,7 @@ class Scheduler:
             source_url=source_url,
             matched_items=matched_items
         )
+        return True
 
     async def _digest_loop(self):
         """每日早报循环调度"""

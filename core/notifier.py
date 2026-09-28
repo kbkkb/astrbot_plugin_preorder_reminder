@@ -161,17 +161,25 @@ class Notifier:
     def format_recent_notices(
         notices: List[Dict[str, Any]],
         days: int = 7,
-        notice_type: str = "replenish"
+        notice_type: str = "replenish",
+        shop_name: str = "",
+        extra_hint: str = ""
     ) -> str:
         """格式化近期（如7天内）的补款或开订汇总列表"""
         type_desc = "补款情报" if notice_type == "replenish" else "新开预订"
         icon = "🚨" if notice_type == "replenish" else "🛒"
         period_desc = "今日" if days == 1 else f"近 {days} 天"
-        if not notices:
-            return f"🍵 {period_desc}各大监控店铺暂无最新{type_desc}。"
+        target_name = f"【{shop_name}】" if shop_name else "各大监控店铺"
 
+        if not notices:
+            msg = f"🍵 {period_desc}{target_name}暂无最新{type_desc}。"
+            if extra_hint:
+                msg += f"\n💡 说明：{extra_hint}"
+            return msg
+
+        title_header = f"{icon}【{period_desc}{target_name}{type_desc}汇总】(共 {len(notices)} 条)" if shop_name else f"{icon}【{period_desc}模玩{type_desc}汇总】(共 {len(notices)} 条)"
         lines = [
-            f"{icon}【{period_desc}模玩{type_desc}汇总】(共 {len(notices)} 条)",
+            title_header,
             "================================"
         ]
         for n in notices[:25]:
@@ -188,4 +196,7 @@ class Notifier:
             "--------------------------------",
             "💡 提示：使用 `@Bot 查我的补款清单` 检查您名下的在监商品是否在列！"
         ])
+        if extra_hint:
+            lines.append(f"💡 说明：{extra_hint}")
         return "\n".join(lines).strip()
+

@@ -24,7 +24,7 @@ logger = logging.getLogger("astrbot_plugin_preorder_reminder")
     "astrbot_plugin_preorder_reminder",
     "eskyfun",
     "手办模玩预售补款提醒与小店情报管家",
-    "1.0.0"
+    "1.1.0"
 )
 class PreorderReminderPlugin(Star):
     def __init__(self, context, config: Optional[dict] = None):
@@ -38,7 +38,8 @@ class PreorderReminderPlugin(Star):
 
         # 2. 情报渠道
         self.weibo_channel = WeiboChannel(
-            rss_base_url=self.config.get("wechat_rss_base_url", "")
+            custom_cookie=self.config.get("weibo_cookie", ""),
+            rss_base_url=self.config.get("weibo_rss_base_url", "")
         )
         self.wechat_channel = WeChatChannel(
             rss_base_url=self.config.get("wechat_rss_base_url", "")
@@ -181,7 +182,50 @@ class PreorderReminderPlugin(Star):
             qq_groups=groups,
             notes=notes.strip()
         )
-        yield event.plain_result(f"✅ 成功录入/更新店铺【{name}】档案！\n发送 `/店铺列表` 可查看详情。")
+        # 立即异步执行一次该店铺的初次抓取，无需等待定时轮询
+        shop_obj = self.db.get_shop_by_name(name)
+        if shop_obj:
+            asyncio.create_task(self.scheduler.poll_single_shop(shop_obj))
+
+        yield event.plain_result(f"✅ 成功录入/更新店铺【{name}】档案！已触发初次数据拉取。\n发送 `/店铺列表` 可查看详情。")
+
+    @filter.command("刷新店铺")
+    async def cmd_refresh_shop(self, event: AstrMessageEvent, shop_name: str):
+        """立即对指定店铺执行一次拉取更新。用法：/刷新店铺 GSC"""
+        yield event.plain_result(f"⏳ 正在即时刷新店铺【{shop_name}】的情报...")
+        res = await self.scheduler.refresh_shop(shop_name)
+        yield event.plain_result(res["msg"])
+
+    @filter.command("设置微博cookie")
+    async def cmd_set_weibo_cookie(self, event: AstrMessageEvent, cookie: str):
+        """设置微博爬虫Cookie（用于绕过微博432风控）。用法：/设置微博cookie <SUB值或完整Cookie>"""
+        if not self._is_admin(event.get_sender_id()):
+            yield event.plain_result("❌ 抱歉，只有管理员有权设置 Cookie。")
+            return
+        self.weibo_channel.set_cookie(cookie)
+        yield event.plain_result("✅ 微博爬虫 Cookie 已更新并立即生效！后续所有店铺微博拉取将自动携带该凭据。")
+
+    @filter.command("录入通知")
+    async def cmd_record_notice(self, event: AstrMessageEvent, shop_name: str, notice_type: str, content: str):
+        """手动录入一条补款或开订情报。用法：/录入通知 GSC 补款 25号初音韶华手办开补"""
+        if not self._is_admin(event.get_sender_id()):
+            yield event.plain_result("❌ 抱歉，只有管理员有权手动录入通知。")
+            return
+        ntype = "replenish" if ("补" in notice_type or "款" in notice_type) else "new_preorder"
+        nid = self.db.record_manual_notice(shop_name=shop_name, notice_type=ntype, content=content)
+        shop = self.db.get_shop_by_name(shop_name)
+        asyncio.create_task(self.scheduler.process_single_notice({
+            "id": nid,
+            "shop_id": shop["id"] if shop else None,
+            "shop_name": shop["name"] if shop else shop_name,
+            "channel": "manual",
+            "source_id": f"manual_{nid}",
+            "title": content[:30],
+            "content": content,
+            "source_url": ""
+        }))
+        type_str = "补款通知" if ntype == "replenish" else "新开预订"
+        yield event.plain_result(f"✅ 已成功录入【{shop_name}】的{type_str}！已自动比对在监商品并执行推送。")
 
     @filter.command("删除店铺")
     async def cmd_del_shop(self, event: AstrMessageEvent, shop_name_or_id: str):
@@ -373,7 +417,10 @@ class PreorderReminderPlugin(Star):
             wechat_account=wechat_account,
             qq_groups=groups
         )
-        return f"已成功更新/录入店铺【{shop_name}】的情报渠道！"
+        shop_obj = self.db.get_shop_by_name(shop_name)
+        if shop_obj:
+            asyncio.create_task(self.scheduler.poll_single_shop(shop_obj))
+        return f"已成功更新/录入店铺【{shop_name}】的情报渠道！已触发初次数据拉取。"
 
     @filter.llm_tool(name="query_my_preorders")
     async def tool_query_my_preorders(self, event: AstrMessageEvent) -> str:
@@ -414,25 +461,98 @@ class PreorderReminderPlugin(Star):
         self,
         event: AstrMessageEvent,
         days: int = 7,
-        notice_type: str = "replenish"
+        notice_type: str = "replenish",
+        shop_name: str = ""
     ) -> str:
-        """查询近期（如7天内、本周、3天内或今日）各大模玩店铺发布的补款公告或新开预订手办情报。
+        """查询近期（如7天内、本周、3天内或今日）各大模玩店铺或指定店铺发布的补款公告或新开预订手办情报。
 
-        当用户询问“查一下最近7天的补款”、“本周有什么补款”、“近几天有哪些新开预定”、“今天有什么开补”等时调用。
+        当用户询问“查一下最近7天的补款”、“本周有什么补款”、“近几天有哪些新开预定”、“gsc近期有补款通知，请你搜索”、“猫受屋最近补款”等时调用。
 
         Args:
             days(number): 查询最近几天内的情报，默认 7（例如 7 表示最近一周，1 表示今日）
             notice_type(string): 查询类型，可选 'replenish' (补款) 或 'new_preorder' (新开预订)
+            shop_name(string): 可选，指定店铺名称或别名（如 'GSC'、'良笑'、'猫受屋'），留空则查询所有监控店铺
         """
         d = max(1, int(days)) if str(days).isdigit() else 7
-        notices = self.db.get_recent_notices(days=d, notice_type=notice_type)
-        return self.notifier.format_recent_notices(notices, days=d, notice_type=notice_type)
+        target_shop = None
+        if shop_name:
+            target_shop = self.db.get_shop_by_name(shop_name)
+            if not target_shop:
+                return f"系统监控库中未找到名为【{shop_name}】的店铺档案。您可以先使用指令 `/添加店铺 {shop_name}` 将其加入监控。"
+
+        filter_shop_name = target_shop["name"] if target_shop else ""
+        notices = self.db.get_recent_notices(days=d, notice_type=notice_type, shop_name=filter_shop_name)
+        extra_hint = ""
+
+        if target_shop and not notices:
+            # 本地无记录时，尝试即时增量拉取一次
+            refresh_res = await self.scheduler.refresh_shop(target_shop["name"])
+            status_info = refresh_res.get("channel_status", {})
+            if status_info.get("status") == "need_cookie":
+                extra_hint = "该店铺微博触发反爬验证(HTTP 432/需登录)，暂无法自动抓取。请联系管理员私聊使用 `/设置微博cookie <cookie>` 配置 Cookie，或发送 `/录入通知` 手动登记。"
+            elif refresh_res.get("new_count", 0) > 0:
+                notices = self.db.get_recent_notices(days=d, notice_type=notice_type, shop_name=filter_shop_name)
+            else:
+                extra_hint = "已即时检查网络渠道，但该店铺近几天尚未发布或抓取到相关情报。"
+
+        return self.notifier.format_recent_notices(
+            notices,
+            days=d,
+            notice_type=notice_type,
+            shop_name=target_shop["name"] if target_shop else shop_name,
+            extra_hint=extra_hint
+        )
 
     @filter.llm_tool(name="query_today_notices")
-    async def tool_query_today_notices(self, event: AstrMessageEvent, notice_type: str = "replenish") -> str:
+    async def tool_query_today_notices(
+        self,
+        event: AstrMessageEvent,
+        notice_type: str = "replenish",
+        shop_name: str = ""
+    ) -> str:
         """查询今日各店铺最新的补款公告或新开预订手办情报。
 
         Args:
             notice_type(string): 查询类型，可选 'replenish' (补款) 或 'new_preorder' (新开预订)
+            shop_name(string): 可选，指定店铺名称或别名（如 'GSC'、'良笑'、'猫受屋'），留空则查询所有监控店铺
         """
-        return await self.tool_query_recent_notices(event, days=1, notice_type=notice_type)
+        return await self.tool_query_recent_notices(event, days=1, notice_type=notice_type, shop_name=shop_name)
+
+    @filter.llm_tool(name="record_manual_notice")
+    async def tool_record_manual_notice(
+        self,
+        event: AstrMessageEvent,
+        shop_name: str,
+        notice_type: str,
+        content: str,
+        source_url: str = ""
+    ) -> str:
+        """手动为店铺登记/补录一条补款公告或新开预订情报。当用户明确告知某店某日发布了什么补款/开订时调用。
+
+        Args:
+            shop_name(string): 店铺名称或别名（如 'GSC'、'良笑'、'猫受屋'）
+            notice_type(string): 情报类型，'replenish' (补款通知) 或 'new_preorder' (新开预订)
+            content(string): 公告正文内容或包含的具体补款商品详情
+            source_url(string): 可选，情报原链接或说明
+        """
+        ntype = "replenish" if ("补" in notice_type or "款" in notice_type) else "new_preorder"
+        nid = self.db.record_manual_notice(
+            shop_name=shop_name,
+            notice_type=ntype,
+            content=content,
+            source_url=source_url
+        )
+        shop = self.db.get_shop_by_name(shop_name)
+        asyncio.create_task(self.scheduler.process_single_notice({
+            "id": nid,
+            "shop_id": shop["id"] if shop else None,
+            "shop_name": shop["name"] if shop else shop_name,
+            "channel": "manual",
+            "source_id": f"manual_{nid}",
+            "title": content[:30],
+            "content": content,
+            "source_url": source_url
+        }))
+        desc = "补款公告" if ntype == "replenish" else "新开预订情报"
+        return f"已成功为店铺【{shop_name}】登记该条{desc}，并已完成对所有在监用户的补款比对！"
+
