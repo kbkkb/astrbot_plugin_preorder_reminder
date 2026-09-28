@@ -156,3 +156,36 @@ class Notifier:
 
         lines.append("💡 发送 `@Bot 查我的补款清单` 检查您名下的在监商品！")
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def format_recent_notices(
+        notices: List[Dict[str, Any]],
+        days: int = 7,
+        notice_type: str = "replenish"
+    ) -> str:
+        """格式化近期（如7天内）的补款或开订汇总列表"""
+        type_desc = "补款情报" if notice_type == "replenish" else "新开预订"
+        icon = "🚨" if notice_type == "replenish" else "🛒"
+        period_desc = "今日" if days == 1 else f"近 {days} 天"
+        if not notices:
+            return f"🍵 {period_desc}各大监控店铺暂无最新{type_desc}。"
+
+        lines = [
+            f"{icon}【{period_desc}模玩{type_desc}汇总】(共 {len(notices)} 条)",
+            "================================"
+        ]
+        for n in notices[:25]:
+            shop = n.get("shop_name", "小店")
+            dt = (n.get("created_at") or "")[:10]  # YYYY-MM-DD
+            time_tag = f"[{dt}] " if dt and days > 1 else ""
+            title = n.get("title") or n.get("content")[:35].replace("\n", " ")
+            lines.append(f" • {time_tag}[{shop}] {title}")
+
+        if len(notices) > 25:
+            lines.append(f"... 仅展示前 25 条，共 {len(notices)} 条记录")
+
+        lines.extend([
+            "--------------------------------",
+            "💡 提示：使用 `@Bot 查我的补款清单` 检查您名下的在监商品是否在列！"
+        ])
+        return "\n".join(lines).strip()

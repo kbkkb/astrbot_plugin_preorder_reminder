@@ -266,29 +266,33 @@ class PreorderReminderPlugin(Star):
         self.db.update_subscription_status(target_sub["id"], status="completed")
         yield event.plain_result(f"🎉 已将【{target_sub['item_name']}】标记为【已完成补款】！")
 
+    @filter.command("近期补款")
+    async def cmd_recent_replenish(self, event: AstrMessageEvent, days: int = 7):
+        """查看近期（默认7天内）各大店铺的补款公告。用法：/近期补款 或 /近期补款 7"""
+        d = max(1, int(days)) if str(days).isdigit() else 7
+        notices = self.db.get_recent_notices(days=d, notice_type="replenish")
+        yield event.plain_result(self.notifier.format_recent_notices(notices, days=d, notice_type="replenish"))
+
     @filter.command("今日补款")
-    async def cmd_today_replenish(self, event: AstrMessageEvent):
-        """查看今日最新开补情报"""
-        notices = self.db.get_recent_notices(days=1, notice_type="replenish")
-        if not notices:
-            yield event.plain_result("🍵 今日各大监控店铺暂无最新开补公告。")
-            return
-        lines = [f"🚨【今日最新补款情报】(共 {len(notices)} 条)", "================================"]
-        for n in notices[:12]:
-            lines.append(f"• [{n.get('shop_name')}] {n.get('title') or n.get('content')[:35]}")
-        yield event.plain_result("\n".join(lines))
+    async def cmd_today_replenish(self, event: AstrMessageEvent, days: int = 1):
+        """查看今日（或指定天数内）最新开补情报。用法：/今日补款 或 /今日补款 3"""
+        d = max(1, int(days)) if str(days).isdigit() else 1
+        notices = self.db.get_recent_notices(days=d, notice_type="replenish")
+        yield event.plain_result(self.notifier.format_recent_notices(notices, days=d, notice_type="replenish"))
+
+    @filter.command("近期开订")
+    async def cmd_recent_preorder(self, event: AstrMessageEvent, days: int = 7):
+        """查看近期（默认7天内）各大店铺的新开预订手办新品。用法：/近期开订 或 /近期开订 7"""
+        d = max(1, int(days)) if str(days).isdigit() else 7
+        notices = self.db.get_recent_notices(days=d, notice_type="new_preorder")
+        yield event.plain_result(self.notifier.format_recent_notices(notices, days=d, notice_type="new_preorder"))
 
     @filter.command("今日开订")
-    async def cmd_today_preorder(self, event: AstrMessageEvent):
-        """查看今日最新开订情报"""
-        notices = self.db.get_recent_notices(days=1, notice_type="new_preorder")
-        if not notices:
-            yield event.plain_result("🍵 今日暂未检测到最新开订手办新品。")
-            return
-        lines = [f"🛒【今日新开预订手办/周边】(共 {len(notices)} 条)", "================================"]
-        for n in notices[:12]:
-            lines.append(f"• [{n.get('shop_name')}] {n.get('title') or n.get('content')[:35]}")
-        yield event.plain_result("\n".join(lines))
+    async def cmd_today_preorder(self, event: AstrMessageEvent, days: int = 1):
+        """查看今日最新开订情报。用法：/今日开订 或 /今日开订 3"""
+        d = max(1, int(days)) if str(days).isdigit() else 1
+        notices = self.db.get_recent_notices(days=d, notice_type="new_preorder")
+        yield event.plain_result(self.notifier.format_recent_notices(notices, days=d, notice_type="new_preorder"))
 
     # ==================== 自然语言 LLM Tools ====================
 
@@ -405,6 +409,25 @@ class PreorderReminderPlugin(Star):
         self.db.update_subscription_status(target["id"], status="completed")
         return f"已成功将【{target['item_name']}】标记为已完成补款！"
 
+    @filter.llm_tool(name="query_recent_notices")
+    async def tool_query_recent_notices(
+        self,
+        event: AstrMessageEvent,
+        days: int = 7,
+        notice_type: str = "replenish"
+    ) -> str:
+        """查询近期（如7天内、本周、3天内或今日）各大模玩店铺发布的补款公告或新开预订手办情报。
+
+        当用户询问“查一下最近7天的补款”、“本周有什么补款”、“近几天有哪些新开预定”、“今天有什么开补”等时调用。
+
+        Args:
+            days(number): 查询最近几天内的情报，默认 7（例如 7 表示最近一周，1 表示今日）
+            notice_type(string): 查询类型，可选 'replenish' (补款) 或 'new_preorder' (新开预订)
+        """
+        d = max(1, int(days)) if str(days).isdigit() else 7
+        notices = self.db.get_recent_notices(days=d, notice_type=notice_type)
+        return self.notifier.format_recent_notices(notices, days=d, notice_type=notice_type)
+
     @filter.llm_tool(name="query_today_notices")
     async def tool_query_today_notices(self, event: AstrMessageEvent, notice_type: str = "replenish") -> str:
         """查询今日各店铺最新的补款公告或新开预订手办情报。
@@ -412,11 +435,4 @@ class PreorderReminderPlugin(Star):
         Args:
             notice_type(string): 查询类型，可选 'replenish' (补款) 或 'new_preorder' (新开预订)
         """
-        notices = self.db.get_recent_notices(days=1, notice_type=notice_type)
-        if not notices:
-            type_desc = "补款公告" if notice_type == "replenish" else "新开预订"
-            return f"今日暂无最新的{type_desc}。"
-        lines = [f"今日最新{notice_type}情报列表："]
-        for n in notices[:8]:
-            lines.append(f"• [{n.get('shop_name')}] {n.get('title') or n.get('content')[:30]}")
-        return "\n".join(lines)
+        return await self.tool_query_recent_notices(event, days=1, notice_type=notice_type)
