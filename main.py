@@ -301,13 +301,15 @@ class PreorderReminderPlugin(Star):
         deposit: float = 0.0,
         estimated_month: str = ""
     ) -> str:
-        """
-        订阅某个店铺的某件手办或周边的预售补款提醒。
+        """订阅某个店铺的某件手办或周边的预售补款提醒。
+
         当用户在自然语言中表达如“帮我盯一下猫受屋的初音韶华手办补款”、“我在GSC官方订了黏土人芙莉莲定金30”时调用此工具。
-        :param shop_name: 购买的店铺名称（如 猫受屋、GSC、B站会员购、某淘宝小店）
-        :param item_name: 预订的手办或周边商品名称（如 初音韶华、黏土人芙莉莲）
-        :param deposit: 已支付的定金金额（元），未提及则为 0.0
-        :param estimated_month: 预估补款月份（如 10月、2026-11），未提及则留空
+
+        Args:
+            shop_name(string): 购买的店铺名称（如 猫受屋、GSC、B站会员购、某淘宝小店）
+            item_name(string): 预订的手办或周边商品名称（如 初音韶华、黏土人芙莉莲）
+            deposit(number): 已支付的定金金额（元），未提及则为 0.0
+            estimated_month(string): 预估补款月份（如 10月、2026-11），未提及则留空
         """
         user_id = event.get_sender_id()
         origin = event.unified_msg_origin
@@ -326,8 +328,8 @@ class PreorderReminderPlugin(Star):
 
     @filter.llm_tool(name="list_shops")
     async def tool_list_shops(self, event: AstrMessageEvent) -> str:
-        """
-        查看当前记录的所有模玩店铺档案列表及其绑定的渠道（微博、微信公众号、QQ补款群）。
+        """查看当前记录的所有模玩店铺档案列表及其绑定的渠道（微博、微信公众号、QQ补款群）。
+
         当用户询问“有哪些店铺”、“查看店铺列表”、“我们记录了哪些店”时调用。
         """
         shops = self.db.get_all_shops()
@@ -343,14 +345,16 @@ class PreorderReminderPlugin(Star):
         wechat_account: str = "",
         aliases: str = ""
     ) -> str:
-        """
-        添加或绑定一家模玩店铺的情报渠道。
+        """添加或绑定一家模玩店铺的情报渠道。
+
         当用户说“添加店铺 猫受屋 补款群720694396”、“把猫受屋的微博绑定为12345678”时调用。
-        :param shop_name: 店铺名称
-        :param qq_group: 绑定的补款QQ群号（多个群用逗号分隔）
-        :param weibo_uid: 绑定的微博UID或主页数字
-        :param wechat_account: 绑定的微信公众号名称
-        :param aliases: 店铺别名（多个用逗号分隔）
+
+        Args:
+            shop_name(string): 店铺名称
+            qq_group(string): 绑定的补款QQ群号（多个群用逗号分隔）
+            weibo_uid(string): 绑定的微博UID或主页数字
+            wechat_account(string): 绑定的微信公众号名称
+            aliases(string): 店铺别名（多个用逗号分隔）
         """
         if not self._is_admin(event.get_sender_id()):
             return "权限不足，只有管理员可以添加店铺档案。"
@@ -369,8 +373,8 @@ class PreorderReminderPlugin(Star):
 
     @filter.llm_tool(name="query_my_preorders")
     async def tool_query_my_preorders(self, event: AstrMessageEvent) -> str:
-        """
-        查看当前用户所有在监的手办模玩预售与补款清单。
+        """查看当前用户所有在监的手办模玩预售与补款清单。
+
         当用户询问“查我的补款”、“我订了哪些手办”、“看看我的预定”时调用。
         """
         user_id = event.get_sender_id()
@@ -379,10 +383,12 @@ class PreorderReminderPlugin(Star):
 
     @filter.llm_tool(name="mark_preorder_completed")
     async def tool_mark_preorder_completed(self, event: AstrMessageEvent, item_name_or_id: str) -> str:
-        """
-        将某件预订商品标记为已完成补款。
+        """将某件预订商品标记为已完成补款。
+
         当用户说“我已经补完初音韶华了”、“把101号商品标记已补款”时调用。
-        :param item_name_or_id: 商品名称或商品ID
+
+        Args:
+            item_name_or_id(string): 商品名称或商品ID
         """
         user_id = event.get_sender_id()
         subs = self.db.get_user_subscriptions(user_id)
@@ -401,9 +407,10 @@ class PreorderReminderPlugin(Star):
 
     @filter.llm_tool(name="query_today_notices")
     async def tool_query_today_notices(self, event: AstrMessageEvent, notice_type: str = "replenish") -> str:
-        """
-        查询今日各店铺最新的补款公告或新开预订手办情报。
-        :param notice_type: 查询类型，可选 'replenish' (补款) 或 'new_preorder' (新开预订)
+        """查询今日各店铺最新的补款公告或新开预订手办情报。
+
+        Args:
+            notice_type(string): 查询类型，可选 'replenish' (补款) 或 'new_preorder' (新开预订)
         """
         notices = self.db.get_recent_notices(days=1, notice_type=notice_type)
         if not notices:
