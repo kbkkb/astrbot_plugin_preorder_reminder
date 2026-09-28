@@ -1,0 +1,42 @@
+{
+  "poll_interval_minutes": {
+    "type": "int",
+    "description": "微博与微信公众号轮询间隔（分钟）",
+    "default": 15
+  },
+  "daily_digest_enabled": {
+    "type": "bool",
+    "description": "是否开启每日早报推送（包含今日各店补款与新开预订汇总）",
+    "default": true
+  },
+  "daily_digest_time": {
+    "type": "string",
+    "description": "每日早报推送时间（24小时制 HH:MM）",
+    "default": "09:30"
+  },
+  "default_notify_target_type": {
+    "type": "string",
+    "description": "默认通知方式：private（私聊机器人）或 group（指定群聊）",
+    "default": "private"
+  },
+  "default_notify_group_id": {
+    "type": "string",
+    "description": "当默认通知方式为群聊时，推送消息的目标群号",
+    "default": ""
+  },
+  "admin_users": {
+    "type": "list",
+    "description": "管理员 QQ 列表（有权录入/修改/删除店铺档案），留空则所有人在私聊均可管理",
+    "default": []
+  },
+  "wechat_rss_base_url": {
+    "type": "string",
+    "description": "可选：WeWe-RSS 或微信文章 RSSHub 基础地址（如 http://127.0.0.1:4000）",
+    "default": ""
+  },
+  "enable_llm_fuzzy_match": {
+    "type": "bool",
+    "description": "是否启用大模型辅助模糊语义匹配（提升缩写、昵称、外号与官方商品名的命中率）",
+    "default": true
+  }
+}

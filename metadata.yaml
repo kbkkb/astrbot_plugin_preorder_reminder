@@ -1,0 +1,7 @@
+name: astrbot_plugin_preorder_reminder
+display_name: 手办模玩预售补款提醒管家
+desc: 手办模玩预售补款提醒与小店情报管家。支持绑定小店微信公众号、微博及QQ补款群静默监控，自然语言订阅商品补款提醒，每日推送开补与新开预订情报。
+author: eskyfun
+version: 1.0.0
+repo: https://github.com/kbkkb/astrbot_plugin_preorder_reminder
+astrbot_version: ">=4.0"
