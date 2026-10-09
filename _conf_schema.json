@@ -44,6 +44,11 @@
     "description": "可选：自建 RSSHub 基础地址（如 http://127.0.0.1:1200），通过 RSS 模式拉取微博",
     "default": ""
   },
+  "weibo_channel_enabled": {
+    "type": "bool",
+    "description": "是否启用微博监控渠道。微博已关闭匿名抓取，普通用户建议关闭（关闭后零请求，不影响QQ群/公众号/手动补录）；仅在愿意配置微博Cookie或自建RSSHub时开启",
+    "default": true
+  },
   "enable_llm_fuzzy_match": {
     "type": "bool",
     "description": "是否启用大模型辅助模糊语义匹配（提升缩写、昵称、外号与官方商品名的命中率）",

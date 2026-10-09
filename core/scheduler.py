@@ -18,7 +18,8 @@ class Scheduler:
         daily_digest_enabled: bool = True,
         daily_digest_time: str = "09:30",
         default_notify_target_type: str = "private",
-        default_notify_group_id: str = ""
+        default_notify_group_id: str = "",
+        extractor=None
     ):
         self.db = db
         self.matcher = matcher
@@ -26,6 +27,7 @@ class Scheduler:
         self.weibo_channel = weibo_channel
         self.wechat_channel = wechat_channel
         self.send_message_func = send_message_func
+        self.extractor = extractor
 
         self.poll_interval = max(5, poll_interval_minutes) * 60
         self.daily_digest_enabled = daily_digest_enabled
@@ -167,38 +169,92 @@ class Scheduler:
         notice_type = self.matcher.classify_notice(title, content)
         deadline = self.matcher.extract_deadline(content)
 
+        # 结构化提取：把正文/OCR文本转成 商品名+定金+尾款+截止日期 条目
+        items = []
+        try:
+            items = self.extractor.extract_items(content) if self.extractor else []
+        except Exception as e:
+            logger.debug(f"[Scheduler] 结构化提取异常: {e}")
+
         # 获取该店铺相关的有效订阅
         active_subs = self.db.get_active_subscriptions(shop_name)
         matched_items = []
+
+        # 结构化命中优先：基于已提取商品名匹配，比全文子串更精准
+        product_names = [it.get("product", "") for it in items if it.get("product")]
+        structured_hits = {}   # sub_id -> item
+        if product_names and active_subs:
+            for sub in active_subs:
+                hit, score = self.extractor.match_subscription(sub.get("item_name", ""), product_names)
+                if hit:
+                    best = None
+                    for it in items:
+                        if it.get("product") and it["product"] in product_names:
+                            ok, _ = self.extractor.match_subscription(sub.get("item_name", ""), [it["product"]])
+                            if ok:
+                                best = it
+                                break
+                    if best:
+                        structured_hits[sub["id"]] = best
 
         if active_subs:
             matched_pairs = self.matcher.find_matches_in_subscriptions(
                 shop_name, title, content, active_subs
             )
+            matched_ids = {sub["id"] for sub, _ in matched_pairs}
 
             for sub, score in matched_pairs:
-                matched_items.append(sub.get("item_name"))
-                # 如果是补款通知，发出强提醒并更新状态
-                if notice_type == "replenish":
-                    self.db.update_subscription_status(
-                        sub["id"],
-                        status="replenishing",
-                        deadline=deadline,
-                        source_url=source_url
-                    )
-                    
-                    alert_msg = self.notifier.format_urgent_alert(sub, notice, deadline)
-                    target_type = sub.get("target_type", "private")
-                    target_id = sub.get("target_id") or sub.get("user_id")
+                if sub["id"] not in matched_items:
+                    matched_items.append(sub.get("item_name"))
+                if notice_type != "replenish":
+                    continue
 
-                    try:
-                        await self.send_message_func(target_type, target_id, alert_msg)
-                        logger.info(f"[Scheduler] 🚀 成功向用户【{sub.get('user_id')}】推送【{sub.get('item_name')}】补款紧急提醒！")
-                    except Exception as e:
-                        logger.error(f"[Scheduler] 推送补款提醒给【{target_id}】失败: {e}")
+                # 结构化条目可提供该商品专属的截止日期与价格
+                hit_item = structured_hits.get(sub["id"])
+                sub_deadline = deadline
+                if hit_item and hit_item.get("deadline"):
+                    sub_deadline = hit_item["deadline"]
+
+                self.db.update_subscription_status(
+                    sub["id"],
+                    status="replenishing",
+                    deadline=sub_deadline,
+                    source_url=source_url
+                )
+
+                alert_msg = self.notifier.format_urgent_alert(sub, notice, sub_deadline, hit_item)
+                target_type = sub.get("target_type", "private")
+                target_id = sub.get("target_id") or sub.get("user_id")
+
+                try:
+                    await self.send_message_func(target_type, target_id, alert_msg)
+                    logger.info(f"[Scheduler] 🚀 成功向用户【{sub.get('user_id')}】推送【{sub.get('item_name')}】补款紧急提醒！")
+                except Exception as e:
+                    logger.error(f"[Scheduler] 推送补款提醒给【{target_id}】失败: {e}")
+
+            # 结构化命中但全文匹配漏掉的订阅，补齐推送
+            for sub_id, hit_item in structured_hits.items():
+                if sub_id in matched_ids or notice_type != "replenish":
+                    continue
+                sub = next((s for s in active_subs if s["id"] == sub_id), None)
+                if not sub:
+                    continue
+                matched_items.append(sub.get("item_name"))
+                sub_deadline = hit_item.get("deadline") or deadline
+                self.db.update_subscription_status(
+                    sub["id"], status="replenishing", deadline=sub_deadline, source_url=source_url
+                )
+                try:
+                    await self.send_message_func(
+                        sub.get("target_type", "private"),
+                        sub.get("target_id") or sub.get("user_id"),
+                        self.notifier.format_urgent_alert(sub, notice, sub_deadline, hit_item)
+                    )
+                except Exception as e:
+                    logger.error(f"[Scheduler] 结构化补齐推送失败: {e}")
 
         # 记录到数据库历史通知中
-        self.db.add_notice(
+        notice_id = self.db.add_notice(
             shop_id=shop_id,
             shop_name=shop_name,
             channel=channel,
@@ -210,6 +266,21 @@ class Scheduler:
             matched_items=matched_items,
             created_at=notice.get("created_at")
         )
+
+        # 落库结构化商品条目，供 /商品情报 查询
+        if items and notice_id:
+            try:
+                self.db.add_notice_items(
+                    notice_id=notice_id,
+                    shop_id=shop_id,
+                    shop_name=shop_name,
+                    items=items,
+                    notice_type=notice_type,
+                    created_at=notice.get("created_at")
+                )
+            except Exception as e:
+                logger.debug(f"[Scheduler] 写入结构化商品条目失败: {e}")
+
         return True
 
     async def _digest_loop(self):

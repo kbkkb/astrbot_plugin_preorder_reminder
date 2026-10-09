@@ -82,6 +82,22 @@ class Database:
             );
             """)
 
+            # 4. 结构化商品条目表（从推文/OCR文本提取的产品、价格、日期）
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notice_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notice_id INTEGER,
+                shop_id INTEGER,
+                shop_name TEXT NOT NULL,
+                product TEXT NOT NULL,
+                deposit REAL DEFAULT 0.0,
+                final_payment REAL DEFAULT 0.0,
+                deadline TEXT DEFAULT '',
+                notice_type TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (notice_id) REFERENCES notices(id) ON DELETE CASCADE
+            );
+            """)
             conn.commit()
 
         # 初始化预设知名模玩店铺
@@ -161,24 +177,56 @@ class Database:
         notes: str = ""
     ) -> int:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        aliases_json = json.dumps(aliases or [], ensure_ascii=False)
-        qq_groups_json = json.dumps([str(g).strip() for g in (qq_groups or []) if str(g).strip()], ensure_ascii=False)
-        admin_qq_ids_json = json.dumps([str(u).strip() for u in (admin_qq_ids or []) if str(u).strip()], ensure_ascii=False)
+        name = name.strip()
+        new_aliases = [str(a).strip() for a in (aliases or []) if str(a).strip()]
+        new_groups = [str(g).strip() for g in (qq_groups or []) if str(g).strip()]
+        new_admins = [str(u).strip() for u in (admin_qq_ids or []) if str(u).strip()]
+        weibo_uid = weibo_uid.strip()
+        wechat_account = wechat_account.strip()
+        notes = notes.strip()
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, aliases, weibo_uid, wechat_account, qq_groups, admin_qq_ids, notes FROM shops WHERE name = ?",
+                (name,)
+            )
+            row = cursor.fetchone()
+
+            if row:
+                # 已存在：合并语义更新，避免清空本次未提及的绑定
+                # （别名/QQ群/管理员取并集；weibo/wechat/notes 非空才覆盖）
+                merged_aliases = list(dict.fromkeys(json.loads(row["aliases"] or "[]") + new_aliases))
+                merged_groups = list(dict.fromkeys(json.loads(row["qq_groups"] or "[]") + new_groups))
+                merged_admins = list(dict.fromkeys(json.loads(row["admin_qq_ids"] or "[]") + new_admins))
+                cursor.execute(
+                    """
+                    UPDATE shops SET
+                        aliases = ?, weibo_uid = ?, wechat_account = ?,
+                        qq_groups = ?, admin_qq_ids = ?, notes = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(merged_aliases, ensure_ascii=False),
+                        weibo_uid or (row["weibo_uid"] or ""),
+                        wechat_account or (row["wechat_account"] or ""),
+                        json.dumps(merged_groups, ensure_ascii=False),
+                        json.dumps(merged_admins, ensure_ascii=False),
+                        notes or (row["notes"] or ""),
+                        now,
+                        row["id"],
+                    )
+                )
+                conn.commit()
+                return row["id"]
+
+            aliases_json = json.dumps(new_aliases, ensure_ascii=False)
+            qq_groups_json = json.dumps(new_groups, ensure_ascii=False)
+            admin_qq_ids_json = json.dumps(new_admins, ensure_ascii=False)
             cursor.execute("""
             INSERT INTO shops (name, aliases, weibo_uid, wechat_account, qq_groups, admin_qq_ids, notes, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                aliases=excluded.aliases,
-                weibo_uid=CASE WHEN excluded.weibo_uid != '' THEN excluded.weibo_uid ELSE shops.weibo_uid END,
-                wechat_account=CASE WHEN excluded.wechat_account != '' THEN excluded.wechat_account ELSE shops.wechat_account END,
-                qq_groups=excluded.qq_groups,
-                admin_qq_ids=excluded.admin_qq_ids,
-                notes=excluded.notes,
-                updated_at=excluded.updated_at
-            """, (name.strip(), aliases_json, weibo_uid.strip(), wechat_account.strip(), qq_groups_json, admin_qq_ids_json, notes.strip(), now, now))
+            """, (name, aliases_json, weibo_uid, wechat_account, qq_groups_json, admin_qq_ids_json, notes, now, now))
             conn.commit()
             return cursor.lastrowid
 
@@ -389,6 +437,132 @@ class Database:
             conn.commit()
             return cursor.lastrowid
 
+
+    # ==================== 结构化商品条目 (Notice Items) ====================
+
+    def add_notice_items(
+        self,
+        notice_id: int,
+        shop_id: Optional[int],
+        shop_name: str,
+        items: List[Dict[str, Any]],
+        notice_type: str = "",
+        created_at: Optional[str] = None
+    ) -> int:
+        """批量写入一条通知下提取出的结构化商品条目"""
+        if not items:
+            return 0
+        now = created_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        for it in items:
+            product = str(it.get("product") or "").strip()
+            if not product:
+                continue
+            rows.append((
+                notice_id, shop_id, shop_name.strip(), product,
+                float(it.get("deposit") or 0.0), float(it.get("final_payment") or 0.0),
+                str(it.get("deadline") or ""), notice_type, now
+            ))
+        if not rows:
+            return 0
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany("""
+            INSERT INTO notice_items
+            (notice_id, shop_id, shop_name, product, deposit, final_payment, deadline, notice_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            conn.commit()
+            return len(rows)
+
+    def get_recent_items(
+        self,
+        days: int = 7,
+        shop_name: Optional[str] = None,
+        keyword: Optional[str] = None,
+        notice_type: Optional[str] = None,
+        limit: int = 40
+    ) -> List[Dict[str, Any]]:
+        """查询近期结构化商品条目，支持按店铺/关键词/类型过滤"""
+        since = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        target_shop = self.get_shop_by_name(shop_name) if shop_name else None
+
+        conditions = ["i.created_at >= ?"]
+        params: List[Any] = [since]
+
+        if shop_name:
+            if target_shop:
+                conditions.append("(i.shop_id = ? OR i.shop_name = ? OR i.shop_name LIKE ?)")
+                params.extend([target_shop["id"], target_shop["name"], f"%{shop_name.strip()}%"])
+            else:
+                conditions.append("(i.shop_name = ? OR i.shop_name LIKE ?)")
+                params.extend([shop_name.strip(), f"%{shop_name.strip()}%"])
+
+        if keyword and keyword.strip():
+            conditions.append("i.product LIKE ?")
+            params.append(f"%{keyword.strip()}%")
+
+        if notice_type:
+            conditions.append("i.notice_type = ?")
+            params.append(notice_type)
+
+        query = f"""
+        SELECT i.*, n.title AS notice_title, n.source_url, n.channel
+        FROM notice_items i
+        LEFT JOIN notices n ON i.notice_id = n.id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY i.created_at DESC, i.id DESC
+        LIMIT {int(limit)}
+        """
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_items_for_notice(self, notice_id: int) -> List[Dict[str, Any]]:
+        """获取某条通知下的全部结构化商品条目"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT * FROM notice_items WHERE notice_id = ? ORDER BY id ASC
+            """, (notice_id,))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_user_focused_items(self, user_id: str, days: int = 30, limit: int = 40) -> List[Dict[str, Any]]:
+        """查询用户订阅商品命中的结构化条目（只看玩家关注的部分）"""
+        subs = self.get_user_subscriptions(user_id)
+        if not subs:
+            return []
+        since = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        results = []
+        seen = set()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for sub in subs:
+                item_name = (sub.get("item_name") or "").strip()
+                if not item_name:
+                    continue
+                cursor.execute("""
+                SELECT i.*, n.title AS notice_title, n.source_url
+                FROM notice_items i
+                LEFT JOIN notices n ON i.notice_id = n.id
+                WHERE i.product LIKE ? AND i.created_at >= ?
+                ORDER BY i.created_at DESC, i.id DESC
+                LIMIT 20
+                """, (f"%{item_name}%", since))
+                for r in cursor.fetchall():
+                    key = r["id"]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    d = dict(r)
+                    d["sub_id"] = sub.get("id")
+                    d["sub_item"] = item_name
+                    results.append(d)
+                    if len(results) >= limit:
+                        return results
+        return results
     def is_notice_processed(self, source_id: str) -> bool:
         with self._get_connection() as conn:
             cursor = conn.cursor()

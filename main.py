@@ -12,6 +12,7 @@ from astrbot.core.platform.astr_message_event import MessageSession
 
 from .core.database import Database
 from .core.matcher import Matcher
+from .core.extractor import ReplenishExtractor
 from .core.notifier import Notifier
 from .core.scheduler import Scheduler
 from .channels.weibo_channel import WeiboChannel
@@ -34,12 +35,14 @@ class PreorderReminderPlugin(Star):
         # 1. 核心持久化与业务组件
         self.db = Database()
         self.matcher = Matcher(enable_llm=self.config.get("enable_llm_fuzzy_match", True))
+        self.extractor = ReplenishExtractor()
         self.notifier = Notifier()
 
         # 2. 情报渠道
         self.weibo_channel = WeiboChannel(
             custom_cookie=self.config.get("weibo_cookie", ""),
-            rss_base_url=self.config.get("weibo_rss_base_url", "")
+            rss_base_url=self.config.get("weibo_rss_base_url", ""),
+            enabled=bool(self.config.get("weibo_channel_enabled", True))
         )
         self.wechat_channel = WeChatChannel(
             rss_base_url=self.config.get("wechat_rss_base_url", ""),
@@ -60,7 +63,8 @@ class PreorderReminderPlugin(Star):
             daily_digest_enabled=bool(self.config.get("daily_digest_enabled", True)),
             daily_digest_time=str(self.config.get("daily_digest_time", "09:30")),
             default_notify_target_type=str(self.config.get("default_notify_target_type", "private")),
-            default_notify_group_id=str(self.config.get("default_notify_group_id", ""))
+            default_notify_group_id=str(self.config.get("default_notify_group_id", "")),
+            extractor=self.extractor
         )
 
     async def initialize(self):
@@ -278,7 +282,20 @@ class PreorderReminderPlugin(Star):
             res.append(f"💰 已付定金：¥{deposit}")
         if est_month:
             res.append(f"📅 预估月份：{est_month}")
-        res.append("📡 监控渠道已就绪（微博 / 公众号 / QQ补款群），开补时将第一时间为您推送！")
+        # 渠道提示按店铺实际绑定动态生成，避免承诺未绑定/不可用的渠道
+        bound_shop = self.db.get_shop_by_name(shop_name) if shop_name else None
+        if bound_shop:
+            ch_names = []
+            if bound_shop.get("weibo_uid") and self.weibo_channel.enabled:
+                ch_names.append("微博")
+            if bound_shop.get("wechat_account"):
+                ch_names.append("微信公众号")
+            if bound_shop.get("qq_groups"):
+                ch_names.append("QQ补款群")
+            ch_desc = "、".join(ch_names) if ch_names else "暂未绑定情报渠道"
+        else:
+            ch_desc = "全网监控（群聊/文章解析/手动补录）"
+        res.append(f"📡 监控渠道：{ch_desc}，开补时将第一时间为您推送！")
         yield event.plain_result("\n".join(res))
 
     @filter.command("我的补款")
@@ -340,6 +357,39 @@ class PreorderReminderPlugin(Star):
         notices = self.db.get_recent_notices(days=d, notice_type="new_preorder")
         yield event.plain_result(self.notifier.format_recent_notices(notices, days=d, notice_type="new_preorder"))
 
+
+    # ==================== 结构化商品情报 ====================
+
+    @filter.command("商品情报")
+    async def cmd_item_intel(self, event: AstrMessageEvent, shop_name: str = "", keyword: str = "", days: int = 7):
+        """
+        查看结构化商品情报（商品名/定金/尾款/截止日期）。
+        用法：
+          /商品情报                      -> 近7天全部
+          /商品情报 猫受屋               -> 指定店铺
+          /商品情报 猫受屋 初音          -> 店铺 + 商品关键词
+          /商品情报 "" "" 3              -> 近3天
+        """
+        kw = (keyword or "").strip()
+        d = max(1, int(days)) if str(days).isdigit() else 7
+        items = self.db.get_recent_items(
+            days=d,
+            shop_name=(shop_name or "").strip() or None,
+            keyword=kw or None
+        )
+        yield event.plain_result(
+            self.notifier.format_item_list(items, shop_name=(shop_name or "").strip(),
+                                           keyword=kw, days=d)
+        )
+
+    @filter.command("我的商品情报")
+    async def cmd_my_item_intel(self, event: AstrMessageEvent, days: int = 14):
+        """查看我订阅商品命中的结构化情报（只看我关注的部分）。用法：/我的商品情报 或 /我的商品情报 30"""
+        d = max(1, int(days)) if str(days).isdigit() else 14
+        items = self.db.get_user_focused_items(event.get_sender_id(), days=d)
+        yield event.plain_result(
+            self.notifier.format_item_list(items, shop_name="我的关注", days=d)
+        )
     # ==================== 自然语言 LLM Tools ====================
 
     @filter.llm_tool(name="subscribe_preorder")
@@ -458,6 +508,35 @@ class PreorderReminderPlugin(Star):
         self.db.update_subscription_status(target["id"], status="completed")
         return f"已成功将【{target['item_name']}】标记为已完成补款！"
 
+
+    @filter.llm_tool(name="query_shop_items")
+    async def tool_query_shop_items(
+        self,
+        event: AstrMessageEvent,
+        shop_name: str = "",
+        keyword: str = "",
+        days: int = 7
+    ) -> str:
+        """查询结构化商品情报：具体商品名、定金、尾款、补款截止日期。
+
+        当用户询问“猫受屋最近有哪些补款商品”、“初音韶华补款多少钱/什么时候截止”、
+        “整理一下这周的补款清单”等需要具体商品与价格明细时调用。
+        数据来源于公众号推文正文与海报图片OCR识别后的结构化提取。
+
+        Args:
+            shop_name(string): 可选，店铺名称或别名（如 '猫受屋'、'GSC'），留空查所有店铺
+            keyword(string): 可选，商品关键词（如 '初音'、'芙莉莲'），用于只看关心的商品
+            days(number): 查询最近几天，默认 7
+        """
+        d = max(1, int(days)) if str(days).isdigit() else 7
+        items = self.db.get_recent_items(
+            days=d,
+            shop_name=(shop_name or "").strip() or None,
+            keyword=(keyword or "").strip() or None
+        )
+        return self.notifier.format_item_list(
+            items, shop_name=(shop_name or "").strip(), keyword=(keyword or "").strip(), days=d
+        )
     @filter.llm_tool(name="query_recent_notices")
     async def tool_query_recent_notices(
         self,
@@ -496,7 +575,9 @@ class PreorderReminderPlugin(Star):
             wx_s = c_status.get("wechat")
             hints = []
             if wb_s and wb_s.get("status") == "need_cookie":
-                hints.append("该店铺微博触发反爬验证(HTTP 432/需登录)，需配置微博Cookie（私聊发送 `/设置微博cookie <cookie>`）")
+                hints.append("该店铺微博受平台反爬限制暂无法自动抓取（不影响QQ群/公众号监控与手动补录；进阶用户可私聊 `/设置微博cookie <cookie>` 或在面板配置 RSSHub 恢复）")
+            if wb_s and wb_s.get("status") == "disabled":
+                hints.append("部署者已在配置中关闭微博渠道")
             if wx_s and wx_s.get("status") == "need_service":
                 hints.append(f"该店铺绑定了微信公众号【{target_shop.get('wechat_account')}】，但系统未配置公众号抓取服务(wechat_rss_base_url)。微信官方禁止外部免登录爬虫，请配置WeWe-RSS服务，或直接把文章链接发送给Bot解析")
 
@@ -558,7 +639,7 @@ class PreorderReminderPlugin(Star):
             if wx_account and not self.config.get("wechat_rss_base_url"):
                 hints.append(f"该店绑定了公众号【{wx_account}】，但系统未配置公众号抓取服务(wechat_rss_base_url)。微信官方禁止外部免登录爬虫，请配置WeWe-RSS服务，或直接把文章链接发送给Bot进行即时解析")
             if wb_uid and not self.config.get("weibo_cookie") and not self.weibo_channel.custom_cookie:
-                hints.append(f"该店绑定了微博UID【{wb_uid}】，因微博432风控需配置Cookie（私聊发送 /设置微博cookie）")
+                hints.append(f"该店绑定了微博UID【{wb_uid}】，微博受平台反爬限制暂无法自动抓取（进阶可选：私聊发送 /设置微博cookie 或配置 RSSHub）")
 
             hint_str = "；".join(hints) if hints else "该店铺目前尚未成功拉取到历史博文或文章"
             return f"数据库中暂无【{target_shop['name']}】的历史文章/公告记录。\n💡 原因诊断：{hint_str}。"

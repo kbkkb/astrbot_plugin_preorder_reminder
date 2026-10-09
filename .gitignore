@@ -27,3 +27,11 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地开发测试脚手架（防止误上传到 git）
+/mock_site/
+/test_*.py
+/run_*_tests.py
+/probe_*.py
+/smoke_*.py
+/tests/

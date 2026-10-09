@@ -60,11 +60,19 @@ class WeChatChannel(BaseChannel):
         # 2. 如果启用了 OCR，提取图片并进行本地识别
         if self.enable_ocr:
             img_urls = []
+            seen_src = set()
             for img in soup.find_all("img"):
-                src = img.get("data-src") or img.get("src") or ""
-                if src and src.startswith("http"):
-                    img_urls.append(src)
-
+                # 微信图片字段优先级：data-src(懒加载原图) > data-backsrc > src
+                src = (img.get("data-src") or img.get("data-backsrc")
+                       or img.get("src") or "")
+                if not src or not src.startswith("http"):
+                    continue
+                # data-src 常带 mmbiz 图片参数，统一成可访问原图
+                src = src.replace("&amp;", "&")
+                if src in seen_src:
+                    continue
+                seen_src.add(src)
+                img_urls.append(src)
             if img_urls:
                 try:
                     try:
@@ -79,6 +87,13 @@ class WeChatChannel(BaseChannel):
                         )
                         if ocr_text:
                             clean_text = f"{clean_text}\n\n【📷 本地OCR识别海报/排期图内容】\n{ocr_text}"
+                        else:
+                            clean_text += (f"\n\n【📷 该文含 {len(img_urls)} 张图片但未能识别出文字】"
+                                           "（图片可能为纯排版或清晰度不足）")
+                    else:
+                        clean_text += (f"\n\n【📷 该文含 {len(img_urls)} 张图片】"
+                                       "（本地OCR引擎未就绪，未安装 rapidocr_onnxruntime，"
+                                       "安装 requirements.txt 依赖后可自动识别海报文字）")
                 except Exception as e:
                     logger.debug(f"[WeChatChannel] 本地 OCR 识别异常: {e}")
 
@@ -105,13 +120,15 @@ class WeChatChannel(BaseChannel):
                             async with session.get(ep, timeout=12) as resp:
                                 if resp.status == 200:
                                     xml_text = await resp.text()
-                                    soup = BeautifulSoup(xml_text, "xml")
+                                    soup = self.parse_xml(xml_text)
                                     items = soup.find_all("item")
                                     for item in items[:8]:
                                         title = item.title.text if item.title else ""
                                         desc = await self.extract_article_body_and_ocr(item.description.text, session) if item.description else ""
                                         link = item.link.text if item.link else ""
                                         guid = item.guid.text if item.guid else link or title
+                                        pub_el = self.find_child_ci(item, "pubDate")
+                                        pub_text = pub_el.text if pub_el else ""
                                         results.append({
                                             "shop_id": shop.get("id"),
                                             "shop_name": shop.get("name"),
@@ -120,7 +137,7 @@ class WeChatChannel(BaseChannel):
                                             "title": title,
                                             "content": f"{title}\n\n{desc[:10000]}",
                                             "source_url": link,
-                                            "created_at": item.pubDate.text if item.pubDate else ""
+                                            "created_at": self.normalize_time(pub_text)
                                         })
                                     if results:
                                         self.last_status[wechat_account] = {"status": "ok", "msg": f"WeWe-RSS抓取成功({len(results)}篇)"}
@@ -207,8 +224,16 @@ class WeChatChannel(BaseChannel):
                             except Exception:
                                 pass
 
+                            # 主动读取推文正文：优先直接抓正文，失败再用摘要兜底
                             article_content = ""
                             if real_url:
+                                try:
+                                    article = await self.parse_article_url(real_url)
+                                    if article and article.get("content"):
+                                        article_content = article["content"]
+                                except Exception:
+                                    pass
+                            if not article_content and real_url:
                                 try:
                                     async with session.get(real_url, headers=headers, timeout=10) as r3:
                                         if r3.status == 200:
@@ -219,9 +244,14 @@ class WeChatChannel(BaseChannel):
                                 except Exception:
                                     pass
 
+                            # 仍拿不到正文时，保留摘要并明确标注（避免把摘要当成完整情报）
+                            content_is_snippet = False
                             if not article_content:
                                 p_info = b.find("p", class_="txt-info")
                                 article_content = p_info.get_text().strip() if p_info else raw_title
+                                content_is_snippet = True
+                                if real_url:
+                                    article_content += f"\n\n（⚠️ 仅获取到摘要，未能读取正文；可发送该链接让Bot解析：{real_url}）"
 
                             results.append({
                                 "shop_id": shop.get("id"),

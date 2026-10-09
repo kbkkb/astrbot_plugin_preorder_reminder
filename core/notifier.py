@@ -1,13 +1,14 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 class Notifier:
     @staticmethod
     def format_urgent_alert(
         sub: Dict[str, Any],
         notice: Dict[str, Any],
-        deadline: str = ""
+        deadline: str = "",
+        item: Optional[Dict[str, Any]] = None
     ) -> str:
-        """格式化单条紧急补款提醒"""
+        """格式化单条紧急补款提醒（命中结构化商品时附带定金/尾款信息）"""
         channel_names = {
             "weibo": "微博动态",
             "wechat": "微信公众号推文",
@@ -15,15 +16,23 @@ class Notifier:
         }
         channel_str = channel_names.get(notice.get("channel"), notice.get("channel", "情报源"))
         deadline_str = deadline or notice.get("replenish_deadline") or "以店铺通知为准"
-        
+
         lines = [
             "🚨【手办模玩 · 紧急补款通知】🚨",
             "--------------------------------",
             f"📦 预订商品：{sub.get('item_name')}",
             f"🏬 对应店铺：{notice.get('shop_name') or sub.get('shop_name') or '未指定'}",
             f"⏰ 补款截止：{deadline_str}",
-            f"📡 情报来源：{channel_str}",
         ]
+
+        # 结构化条目提供的价格信息
+        if item:
+            if item.get("deposit"):
+                lines.append(f"💰 已付定金：¥{item['deposit']:g}")
+            if item.get("final_payment"):
+                lines.append(f"💳 待补尾款：¥{item['final_payment']:g}")
+
+        lines.append(f"📡 情报来源：{channel_str}")
 
         if notice.get("title"):
             lines.append(f"📌 通知标题：{notice['title']}")
@@ -200,3 +209,56 @@ class Notifier:
             lines.append(f"💡 说明：{extra_hint}")
         return "\n".join(lines).strip()
 
+
+    @staticmethod
+    def format_item_list(
+        items: List[Dict[str, Any]],
+        shop_name: str = "",
+        keyword: str = "",
+        days: int = 7
+    ) -> str:
+        """格式化结构化商品情报列表（含商品名、定金、尾款、截止日期）"""
+        target = f"【{shop_name}】" if shop_name else "各监控店铺"
+        period = "今日" if days == 1 else f"近 {days} 天"
+
+        if not items:
+            msg = f"🍵 {period}{target}暂无结构化商品情报。"
+            if keyword:
+                msg = f"🍵 {period}{target}未找到与【{keyword}】相关的商品情报。"
+            msg += "\n💡 可尝试：`/商品情报` 查看全部，或先用 `/解析文章 <链接>` 解析公众号推文。"
+            return msg
+
+        header = f"📋【{period}{target}商品情报】(共 {len(items)} 条)"
+        lines = [header, "================================"]
+
+        for it in items[:30]:
+            product = it.get("product") or "未知商品"
+            shop = it.get("shop_name") or "小店"
+            dt = (it.get("created_at") or "")[:10]
+            time_tag = f"[{dt}] " if dt and days > 1 else ""
+
+            price_parts = []
+            if it.get("deposit"):
+                price_parts.append(f"定金¥{it['deposit']:g}")
+            if it.get("final_payment"):
+                price_parts.append(f"尾款¥{it['final_payment']:g}")
+            price_str = " / ".join(price_parts) if price_parts else "价格未标注"
+
+            dl = it.get("deadline") or ""
+            dl_str = f" | ⏰截止 {dl}" if dl else ""
+            matched_tag = " ⭐" if it.get("sub_item") else ""
+
+            lines.append(f"• {time_tag}[{shop}] {product}{matched_tag}")
+            lines.append(f"    💰 {price_str}{dl_str}")
+
+        if len(items) > 30:
+            lines.append(f"... 仅展示前 30 条，共 {len(items)} 条记录")
+
+        lines.extend([
+            "--------------------------------",
+            "⭐ 标记为您订阅关注中的商品",
+            "💡 指令提示：",
+            "• 只关心某商品：`/商品情报 <店铺名> <关键词>`",
+            "• 只关心我订的：`/我的商品情报`"
+        ])
+        return "\n".join(lines)
